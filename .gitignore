@@ -1,0 +1,8 @@
+# ignore bag files
+bags/
+
+# ignore raw data
+boreas-*/
+
+# ignore rviz
+rviz/
