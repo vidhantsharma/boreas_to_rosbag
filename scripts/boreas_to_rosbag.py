@@ -151,6 +151,46 @@ def load_static_tf(transform_path, parent_frame, child_frame):
     tf.transform.rotation = Quaternion(x=quat[0], y=quat[1], z=quat[2], w=quat[3])
     return tf
 
+def load_inverse_static_tf(transform_path, parent_frame, child_frame):
+    # Load original transformation matrix
+    T = np.loadtxt(transform_path)
+
+    # Invert the transformation matrix
+    T_inv = np.linalg.inv(T)
+
+    # Extract translation and rotation
+    translation = T_inv[:3, 3]
+    quat = tf_transformations.quaternion_from_matrix(T_inv)
+
+    # Populate TransformStamped message
+    tf = TransformStamped()
+    tf.header.stamp = Time(sec=0, nanosec=0)
+    tf.header.frame_id = parent_frame
+    tf.child_frame_id = child_frame
+    tf.transform.translation.x = translation[0]
+    tf.transform.translation.y = translation[1]
+    tf.transform.translation.z = translation[2]
+    tf.transform.rotation = Quaternion(x=quat[0], y=quat[1], z=quat[2], w=quat[3])
+    return tf
+
+def find_closest_timestamp(target_ts, candidates):
+    """
+    Given a target timestamp and a list/array of candidate timestamps (in float seconds),
+    returns the closest candidate and its index.
+    """
+    candidates = np.array(candidates)
+    idx = np.searchsorted(candidates, target_ts)
+    if idx == 0:
+        return candidates[0], 0
+    if idx == len(candidates):
+        return candidates[-1], len(candidates) - 1
+    before = candidates[idx - 1]
+    after = candidates[idx]
+    if abs(target_ts - before) < abs(target_ts - after):
+        return before, idx - 1
+    else:
+        return after, idx
+
 def main(base_path, bag_length):
     rclpy.init()
     lidar_folder = os.path.join(base_path, 'lidar')
@@ -179,8 +219,7 @@ def main(base_path, bag_length):
         metadata = TopicMetadata(
             name=topic,
             type=msg_type_str,
-            serialization_format="cdr"
-        )
+            serialization_format="cdr")
         writer.create_topic(metadata)
 
     # Gather all timestamps from sensor files
@@ -219,11 +258,19 @@ def main(base_path, bag_length):
 
     # Write static transforms
     tf_static = TFMessage()
-    tf_static.transforms.append(load_static_tf(os.path.join(calib_folder, 'T_applanix_lidar.txt'), 'lidar', 'base_link'))
-    tf_static.transforms.append(load_static_tf(os.path.join(calib_folder, 'T_camera_lidar.txt'), 'lidar', 'camera'))
-    tf_static.transforms.append(load_static_tf(os.path.join(calib_folder, 'T_radar_lidar.txt'), 'lidar', 'radar'))
     static_ros_time = Time(sec=start_sec, nanosec=start_nsec)
     static_time = static_ros_time.sec * int(1e9) + static_ros_time.nanosec
+
+    # Load each static transform, then set its stamp properly:
+    # T_A_B -> Transformation from frame A to frame B
+    tf1 = load_static_tf(os.path.join(calib_folder, 'T_applanix_lidar.txt'), 'base_link', 'lidar')
+    tf2 = load_inverse_static_tf(os.path.join(calib_folder, 'T_camera_lidar.txt'), 'lidar', 'camera')
+    tf3 = load_inverse_static_tf(os.path.join(calib_folder, 'T_radar_lidar.txt'), 'lidar', 'radar')
+
+    # Set their header.stamp to match static_ros_time:
+    for tf in [tf1, tf2, tf3]:
+        tf.header.stamp = static_ros_time
+        tf_static.transforms.append(tf)
 
     try:
         writer.write('/tf_static', serialize_message(tf_static), static_time)
@@ -237,12 +284,12 @@ def main(base_path, bag_length):
         ros_time = Time(sec=sec, nanosec=nsec)
         timestamp = ros_time.sec * int(1e9) + ros_time.nanosec
 
+        print(f"processed time : {t_float - sorted_timestamps[0]:.2f} seconds")
+
         if bag_length != -1:
             if (t_float - sorted_timestamps[0] > bag_length):
                 break
         
-        print(f"processed time : {t_float - sorted_timestamps[0]} seconds")
-
         try:
             # lidar
             if 'lidar' in timestamp_to_file[t_float]:
@@ -267,31 +314,38 @@ def main(base_path, bag_length):
             print(f"Failed at {timestamp}: {e}")
 
     poses = pd.read_csv(os.path.join(base_path, 'applanix/gps_post_process.csv'))
+    poses = poses.dropna(subset=['GPSTime', 'easting', 'northing', 'altitude'])
 
-    first_timestamp = poses['GPSTime'].min()
-    for idx, row in tqdm(poses.iterrows()):
-        stamp_sec = int(row['GPSTime'] // 1)
+    # Find closest timestamp in poses to the first sorted timestamp.
+    first_timestamp, first_timestamp_idx = find_closest_timestamp(
+        sorted_timestamps[0], poses['GPSTime'].values
+    )
+
+    for idx, row in tqdm(
+        poses.iloc[first_timestamp_idx:].iterrows(),
+        total=len(poses) - first_timestamp_idx
+    ):
+        stamp_sec = int(row['GPSTime'])
         stamp_nsec = int((row['GPSTime'] % 1) * 1e9)
         ros_time = Time(sec=stamp_sec, nanosec=stamp_nsec)
         timestamp = ros_time.sec * int(1e9) + ros_time.nanosec
 
-        if bag_length != -1:
-            if (row['GPSTime'] - first_timestamp > bag_length):
-                break
-        
-        print(f"processed time : {row['GPSTime'] - first_timestamp} seconds")
+        print(f"processed time : {(row['GPSTime'] - first_timestamp):.2f} seconds")
+
+        if bag_length != -1 and (row['GPSTime'] - first_timestamp > bag_length):
+            break
 
         # Odometry
         odom_msg = create_odometry_msg(row, 'world', 'base_link', ros_time)
         writer.write('/odometry', serialize_message(odom_msg), timestamp)
 
-        # TF (dynamic from world → base_link)
-        # tf_msg = TFMessage([create_tf(row, 'world', 'base_link', ros_time)])
+        # TF (dynamic)
         tf_msg = TFMessage(transforms=[create_tf(row, 'world', 'base_link', ros_time)])
         writer.write('/tf', serialize_message(tf_msg), timestamp)
 
+
 if __name__ == '__main__':
     base_path = r"boreas-2021-01-26-11-22"
-    bag_length = 5 # seconds
+    bag_length = 60 # seconds
     main(base_path, bag_length)
     rclpy.shutdown()
